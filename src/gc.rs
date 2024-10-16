@@ -170,10 +170,34 @@ impl GCAlloc {
             hdr.set_fwd_ptr(ptr_from_header(to_ptr as *const GCHeader));
             to_cursor += total_sz;
         }
+        let new_from_cursor = to_cursor;
+
+        // Rewrite pointers
+        let mut cursor = 0;
+        while cursor < new_from_cursor {
+            let hdr = unsafe {
+                (self.to_half.add(cursor) as *const GCHeader)
+                    .as_ref()
+                    .unwrap()
+            };
+            let sz = hdr.sz;
+            let total_sz = sz + std::mem::size_of::<GCHeader>();
+
+            if hdr.vt.get().is_free() {
+                cursor += total_sz;
+                continue;
+            }
+
+            unsafe {
+                ((*hdr.vt.get().0.ptr()).rewrite_cb)(self, self.to_half.add(cursor));
+            }
+
+            cursor += total_sz;
+        }
 
         // Swap spaces
         std::mem::swap(&mut self.from_half, &mut self.to_half);
-        self.from_cursor = to_cursor;
+        self.from_cursor = new_from_cursor;
     }
 
     /// Call this to mark a pointer as accessible.
