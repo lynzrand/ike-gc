@@ -88,8 +88,18 @@ impl GCAlloc {
         }
 
         self.from_cursor += sz;
-
         let ptr = unsafe { start_ptr.add(std::mem::size_of::<GCHeader>()) };
+
+        // Write a free block after the allocated block
+        let free_header = GCHeader {
+            vt: Cell::new(VTPtr::new_free()),
+            sz: available - sz - std::mem::size_of::<GCHeader>(),
+        };
+        let free_ptr = unsafe { ptr.add(sz) as *mut GCHeader };
+        unsafe {
+            std::ptr::write(free_ptr, free_header);
+        }
+
         Some(unsafe { NonNull::new_unchecked(ptr) })
     }
 
@@ -136,8 +146,17 @@ impl GCAlloc {
             let hdr = unsafe { (from_ptr as *const GCHeader).as_ref().unwrap() };
             let sz = hdr.sz;
             let total_sz = sz + std::mem::size_of::<GCHeader>();
+
+            if hdr.vt.get().is_free() {
+                from_cursor += total_sz;
+                continue;
+            }
+
             let marked = hdr.vt.get().is_marked();
             if !marked {
+                unsafe {
+                    ((*hdr.vt.get().0.ptr()).free_cb)(self, from_ptr);
+                }
                 from_cursor += total_sz;
                 continue;
             }

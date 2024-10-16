@@ -17,6 +17,9 @@ pub struct VTable {
     /// in the object, and update them accordingly. The pointer is guaranteed to be valid and points
     /// to a live object of the expected type.
     rewrite_cb: unsafe fn(&mut GCAlloc, *const u8),
+
+    /// Callback on free. The user is expected to free all resources associated with the object.
+    free_cb: unsafe fn(&mut GCAlloc, *const u8),
 }
 
 /// A tagged pointer to a VTable, with a mark bit. A null pointer is used to represent a free block.
