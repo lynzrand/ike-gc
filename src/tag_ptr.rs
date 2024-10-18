@@ -17,7 +17,7 @@ impl<const TAG_BITS: usize, T> TaggedPtr<TAG_BITS, T> {
     }
 
     pub fn ptr(&self) -> *const T {
-        (self.ptr & !(1 << TAG_BITS)) as *const T
+        (self.ptr & !(1 << (TAG_BITS - 1))) as *const T
     }
 
     pub fn tag(&self) -> usize {

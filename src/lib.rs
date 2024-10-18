@@ -1,25 +1,28 @@
 use std::cell::Cell;
 
-use gc::GCAlloc;
 use tag_ptr::TaggedPtr;
 
 pub mod gc;
+pub mod gc_ptr;
 mod tag_ptr;
+
+pub use gc::GCAlloc;
+pub use gc::Handle;
 
 #[repr(C)]
 pub struct VTable {
     /// Callback on mark. The user is expected to call [`Sweeper::mark_accessible`] on all pointers
     /// in the object. The pointer is guaranteed to be valid and points to a live object of the
     /// expected type.
-    mark_cb: unsafe fn(&mut GCAlloc, *const u8),
+    pub mark_cb: unsafe fn(&mut GCAlloc, *const u8),
 
     /// Callback on rewrite. The user is expected to call [`Sweeper::rewrite_ptr`] on all pointers
     /// in the object, and update them accordingly. The pointer is guaranteed to be valid and points
     /// to a live object of the expected type.
-    rewrite_cb: unsafe fn(&mut GCAlloc, *const u8),
+    pub rewrite_cb: unsafe fn(&mut GCAlloc, *const u8),
 
     /// Callback on free. The user is expected to free all resources associated with the object.
-    free_cb: unsafe fn(&mut GCAlloc, *const u8),
+    pub free_cb: unsafe fn(&mut GCAlloc, *const u8),
 }
 
 /// A tagged pointer to a VTable, with a mark bit. A null pointer is used to represent a free block.
