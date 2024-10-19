@@ -1,4 +1,5 @@
 use ike_gc::{gc_ptr::Gc, GCAlloc, VTable};
+use log::info;
 
 struct Cons {
     car: Option<Gc<Cons>>,
@@ -46,7 +47,7 @@ fn main() {
 
     let mut gc = GCAlloc::new(65536);
 
-    dbg!(gc.metadata());
+    info!("Before allocation; {:?}", gc.metadata());
     let alloc1 = gc
         .allocate_typed::<Cons>(&CONS_VTABLE, Cons::new(None, None))
         .expect("Malloc failed");
@@ -57,14 +58,31 @@ fn main() {
         .allocate_typed::<Cons>(&CONS_VTABLE, Cons::new(Some(alloc2.clone()), None))
         .expect("Malloc failed");
 
-    dbg!(gc.metadata());
-
     let _alloc4 = gc
         .allocate_typed::<Cons>(&CONS_VTABLE, Cons::new(Some(alloc3.clone()), None))
         .expect("Malloc failed");
     let handle3 = gc.acquire_handle(alloc3);
 
+    info!("After allocation; {:?}", gc.metadata());
+
+    info!("Initiate collection");
     gc.collect();
 
-    dbg!(gc.metadata());
+    info!("After collection; {:?}", gc.metadata());
+
+    // match structure
+    let cons3 = gc.get_handle(&handle3);
+    let cons3 = unsafe { &*cons3.get() };
+    assert!(cons3.car.is_some());
+    assert!(cons3.cdr.is_none());
+    let cons2 = unsafe { &*cons3.car.as_ref().unwrap().get() };
+    assert!(cons2.car.is_some());
+    assert!(cons2.cdr.is_none());
+    let cons1 = unsafe { &*cons2.car.as_ref().unwrap().get() };
+    assert!(cons1.car.is_none());
+    assert!(cons1.cdr.is_none());
+
+    gc.release_handle(handle3);
+    gc.collect();
+    info!("After release; {:?}", gc.metadata());
 }

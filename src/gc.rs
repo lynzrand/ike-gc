@@ -40,11 +40,14 @@ pub struct GCAlloc {
 
     handles: SlotMap<HandleKey, NonNull<u8>>,
 
-    metadata: GCMeta,
+    gc_count: usize,
+    meta_total_allocated: usize,
+    meta_high_water_mark: usize,
 }
 
 #[derive(Debug, Default)]
 pub struct GCMeta {
+    pub currently_allocated: usize,
     pub gc_count: usize,
     pub total_allocated: usize,
     pub high_water_mark: usize,
@@ -69,12 +72,20 @@ impl GCAlloc {
             in_gc: false,
             work_list: VecDeque::new(),
             handles: SlotMap::with_key(),
-            metadata: GCMeta::default(),
+
+            gc_count: 0,
+            meta_total_allocated: 0,
+            meta_high_water_mark: 0,
         }
     }
 
-    pub fn metadata(&self) -> &GCMeta {
-        &self.metadata
+    pub fn metadata(&self) -> GCMeta {
+        GCMeta {
+            currently_allocated: self.from_cursor,
+            gc_count: self.gc_count,
+            total_allocated: self.meta_total_allocated,
+            high_water_mark: self.meta_high_water_mark,
+        }
     }
 
     /// Acquire a handle to a pointer of type T. The pointer must be allocated
@@ -103,12 +114,12 @@ impl GCAlloc {
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn allocate_typed<T: Sized>(&mut self, vt: *const VTable, v: T) -> Option<Gc<T>> {
         unsafe {
-            let init_gc_cnt = self.metadata.gc_count;
+            let init_gc_cnt = self.gc_count;
             let ptr = self.allocate(vt, std::mem::size_of::<T>())?;
             let ptr = ptr.cast();
             (ptr.get() as *mut T).write(v);
             // Might have gc during allocation, so we need to run the rewrite callback
-            if self.metadata.gc_count != init_gc_cnt {
+            if self.gc_count != init_gc_cnt {
                 ((*vt).rewrite_cb)(self, ptr.get() as *const u8);
             }
             Some(ptr)
@@ -146,8 +157,8 @@ impl GCAlloc {
         }
 
         self.from_cursor += sz;
-        self.metadata.total_allocated += sz;
-        self.metadata.high_water_mark = self.metadata.high_water_mark.max(self.from_cursor);
+        self.meta_total_allocated += sz;
+        self.meta_high_water_mark = self.meta_high_water_mark.max(self.from_cursor);
         let ptr = unsafe { start_ptr.add(std::mem::size_of::<GCHeader>()) };
 
         // Write a free block after the allocated block
@@ -155,7 +166,12 @@ impl GCAlloc {
             vt: Cell::new(VTPtr::new_free()),
             sz: available - sz,
         };
-        let free_ptr = unsafe { ptr.add(sz) as *mut GCHeader };
+        let free_ptr = unsafe { start_ptr.add(sz) as *mut GCHeader };
+        debug!(
+            "Writing free block of size {} at {:?}",
+            available - sz,
+            free_ptr
+        );
         unsafe {
             std::ptr::write(free_ptr, free_header);
         }
@@ -171,7 +187,7 @@ impl GCAlloc {
         debug!("Starting GC");
 
         self.in_gc = true;
-        self.metadata.gc_count += 1;
+        self.gc_count += 1;
 
         // Mark phase
         // Gather root set
@@ -205,13 +221,18 @@ impl GCAlloc {
         let mut from_cursor = 0;
         debug!("Copying objects");
         while from_cursor < self.space_size {
-            dbg!(from_cursor, to_cursor, self.space_size);
             let from_ptr = unsafe { self.from_half.add(from_cursor) };
             let hdr = unsafe { (from_ptr as *const GCHeader).as_ref().unwrap() };
             let sz = hdr.sz;
+            assert!(
+                sz >= std::mem::size_of::<GCHeader>(),
+                "Invalid size smaller than header: {}, found at {:p}",
+                sz,
+                from_ptr
+            );
 
             if hdr.vt.get().is_free() {
-                debug!("Skipping free block {:p}", from_ptr);
+                debug!("Skipping free block {:p}, size {}", from_ptr, sz);
                 from_cursor += sz;
                 continue;
             }
@@ -226,17 +247,33 @@ impl GCAlloc {
                 continue;
             }
 
-            hdr.unmark();
-
             let to_ptr = unsafe { self.to_half.add(to_cursor) };
             debug!("Copying {:p} to {:p}", from_ptr, to_ptr);
             unsafe {
                 std::ptr::copy_nonoverlapping(from_ptr, to_ptr, sz);
             }
             hdr.set_fwd_ptr(ptr_from_header(to_ptr as *const GCHeader));
+            let to_hdr = unsafe { (to_ptr as *const GCHeader).as_ref().unwrap() };
+            to_hdr.unmark();
+
             from_cursor += sz;
             to_cursor += sz;
         }
+        // Write free block at the end
+        let free_header = GCHeader {
+            vt: Cell::new(VTPtr::new_free()),
+            sz: self.space_size - to_cursor,
+        };
+        let free_ptr = unsafe { self.to_half.add(to_cursor) as *mut GCHeader };
+        debug!(
+            "Writing free block of size {} at {:?}",
+            self.space_size - to_cursor,
+            free_ptr
+        );
+        unsafe {
+            std::ptr::write(free_ptr, free_header);
+        }
+
         let new_from_cursor = to_cursor;
 
         // Rewrite pointers

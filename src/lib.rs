@@ -59,7 +59,10 @@ impl VTPtr {
 /// A GC object header that's exactly 2 pointers wide.
 #[repr(C)]
 struct GCHeader {
+    /// Table to the vtable and mark bit. If the halfspace is being copied, this will be a forward
+    /// pointer.
     vt: Cell<VTPtr>,
+    /// The total size of the cell, including the header.
     sz: usize,
 }
 
