@@ -5,7 +5,11 @@ use log::{debug, error, warn};
 use memmap2::MmapMut;
 use slotmap::{new_key_type, SlotMap};
 
-use crate::{gc_ptr::Gc, GCHeader, VTPtr, VTable};
+use crate::{
+    gc_ptr::Gc,
+    vtable::{VTPtr, VTable},
+    GCHeader,
+};
 
 fn header_from_ptr<T>(ptr: *const T) -> *mut GCHeader {
     let ptr = ptr as *const GCHeader as *mut GCHeader;
@@ -147,7 +151,7 @@ impl GCAlloc {
 
         let start_ptr = unsafe { self.from_half.add(self.from_cursor) };
         let header = GCHeader {
-            vt: Cell::new(VTPtr::new(vt)),
+            vt: Cell::new(VTPtr::new(vt).into()),
             sz,
         };
         debug!("Allocating {} + header bytes at {:?}", sz, start_ptr);
@@ -163,7 +167,7 @@ impl GCAlloc {
 
         // Write a free block after the allocated block
         let free_header = GCHeader {
-            vt: Cell::new(VTPtr::new_free()),
+            vt: Cell::new(VTPtr::new_free().into()),
             sz: available - sz,
         };
         let free_ptr = unsafe { start_ptr.add(sz) as *mut GCHeader };
@@ -206,11 +210,11 @@ impl GCAlloc {
             debug!("Marking {:p}", ptr);
 
             // Call the mark callback
-            let vt = hdr.vt.get();
+            let vt = hdr.get_vt();
             if vt.is_free() {
                 panic!("Free block in work list");
             }
-            let vt = vt.0.ptr();
+            let vt = vt.ptr();
             unsafe {
                 ((*vt).mark_cb)(self, ptr_from_header(ptr));
             }
@@ -231,17 +235,17 @@ impl GCAlloc {
                 from_ptr
             );
 
-            if hdr.vt.get().is_free() {
+            if hdr.get_vt().is_free() {
                 debug!("Skipping free block {:p}, size {}", from_ptr, sz);
                 from_cursor += sz;
                 continue;
             }
 
-            let marked = hdr.vt.get().is_marked();
+            let marked = hdr.get_vt().is_marked();
             if !marked {
                 debug!("Freeing {:p} as it's not marked", from_ptr);
                 unsafe {
-                    ((*hdr.vt.get().0.ptr()).free_cb)(self, from_ptr);
+                    ((*hdr.get_vt().ptr()).free_cb)(self, from_ptr);
                 }
                 from_cursor += sz;
                 continue;
@@ -252,7 +256,7 @@ impl GCAlloc {
             unsafe {
                 std::ptr::copy_nonoverlapping(from_ptr, to_ptr, sz);
             }
-            hdr.set_fwd_ptr(ptr_from_header(to_ptr as *const GCHeader));
+            unsafe { hdr.set_fwd_ptr(ptr_from_header(to_ptr as *const GCHeader)) };
             let to_hdr = unsafe { (to_ptr as *const GCHeader).as_ref().unwrap() };
             to_hdr.unmark();
 
@@ -261,7 +265,7 @@ impl GCAlloc {
         }
         // Write free block at the end
         let free_header = GCHeader {
-            vt: Cell::new(VTPtr::new_free()),
+            vt: Cell::new(VTPtr::new_free().into()),
             sz: self.space_size - to_cursor,
         };
         let free_ptr = unsafe { self.to_half.add(to_cursor) as *mut GCHeader };
@@ -288,13 +292,13 @@ impl GCAlloc {
             let sz = hdr.sz;
             let total_sz = sz + std::mem::size_of::<GCHeader>();
 
-            if hdr.vt.get().is_free() {
+            if hdr.get_vt().is_free() {
                 cursor += total_sz;
                 continue;
             }
 
             unsafe {
-                ((*hdr.vt.get().0.ptr()).rewrite_cb)(self, self.to_half.add(cursor));
+                ((*hdr.get_vt().ptr()).rewrite_cb)(self, self.to_half.add(cursor));
             }
 
             cursor += total_sz;
@@ -303,7 +307,7 @@ impl GCAlloc {
         for handle in self.handles.values_mut() {
             let ptr = handle.as_ptr();
             let header = header_from_ptr(ptr);
-            let fwd_ptr = unsafe { &*header }.fwd_ptr();
+            let fwd_ptr = unsafe { (*header).fwd_ptr() };
             debug!("Rewriting handle {:p} to {:p}", ptr, fwd_ptr);
             *handle = NonNull::new(fwd_ptr as *mut u8).unwrap();
         }
@@ -324,8 +328,13 @@ impl GCAlloc {
     /// Call this to rewrite a pointer.
     pub fn rewrite_ptr<T>(&mut self, ptr: &Gc<T>) {
         let header = header_from_ptr(ptr);
-        let fwd = (unsafe { &*header }).fwd_ptr();
+        let fwd = unsafe { (*header).fwd_ptr() };
         debug!("Rewriting {:p} to {:p}", ptr.get(), fwd);
         ptr.set(fwd as *const T);
+    }
+
+    pub fn in_young_gen<T>(&self, ptr: Gc<T>) -> bool {
+        (ptr.get() as usize) >= (self.from_half as usize)
+            && (ptr.get() as usize) < (self.from_half as usize + self.space_size)
     }
 }

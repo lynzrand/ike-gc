@@ -1,4 +1,4 @@
-use ike_gc::{gc_ptr::Gc, GCAlloc, VTable};
+use ike_gc::{gc_ptr::Gc, GCAlloc, SizeKind, VTable};
 use log::info;
 
 struct Cons {
@@ -37,6 +37,7 @@ fn cons_rewrite(gc: &mut GCAlloc, ptr: *const u8) {
 }
 
 static CONS_VTABLE: VTable = VTable {
+    // size: SizeKind::of::<Cons>(),
     mark_cb: cons_mark,
     rewrite_cb: cons_rewrite,
     free_cb: cons_free,
@@ -86,4 +87,5 @@ fn test_main() {
     gc.release_handle(handle3);
     gc.collect();
     info!("After release; {:?}", gc.metadata());
+    assert!(gc.metadata().currently_allocated == 0);
 }

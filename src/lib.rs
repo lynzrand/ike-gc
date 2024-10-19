@@ -1,99 +1,90 @@
 use std::cell::Cell;
+use std::num::NonZeroUsize;
 
 use tag_ptr::TaggedPtr;
 
 pub mod gc;
 pub mod gc_ptr;
 mod tag_ptr;
+mod vtable;
 
 pub use gc::GCAlloc;
 pub use gc::Handle;
+pub use vtable::SizeKind;
+pub use vtable::VTable;
 
-#[repr(C)]
-pub struct VTable {
-    /// Callback on mark. The user is expected to call [`Sweeper::mark_accessible`] on all pointers
-    /// in the object. The pointer is guaranteed to be valid and points to a live object of the
-    /// expected type.
-    pub mark_cb: unsafe fn(&mut GCAlloc, *const u8),
-
-    /// Callback on rewrite. The user is expected to call [`Sweeper::rewrite_ptr`] on all pointers
-    /// in the object, and update them accordingly. The pointer is guaranteed to be valid and points
-    /// to a live object of the expected type.
-    pub rewrite_cb: unsafe fn(&mut GCAlloc, *const u8),
-
-    /// Callback on free. The user is expected to free all resources associated with the object.
-    pub free_cb: unsafe fn(&mut GCAlloc, *const u8),
+/// The pointer part of the GC header.
+///
+/// During GC, after copying, it might be a forward pointer.
+/// As the two usage do not overlap, we can use the same field for both.
+#[derive(Clone, Copy)]
+union VTablePtrUnion {
+    /// Used as a pointer to the vtable.
+    vt: vtable::VTPtr,
+    /// Used as a forward pointer during GC.
+    fwd: *const u8,
 }
 
-/// A tagged pointer to a VTable, with a mark bit. A null pointer is used to represent a free block.
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct VTPtr(TaggedPtr<1, VTable>);
-
-impl VTPtr {
-    fn new(ptr: *const VTable) -> Self {
-        Self(TaggedPtr::new(ptr, 0))
-    }
-
-    fn new_free() -> Self {
-        Self(TaggedPtr::new(std::ptr::null(), 0))
-    }
-
-    fn is_free(&self) -> bool {
-        self.0.ptr().is_null()
-    }
-
-    fn mark(&mut self) {
-        self.0.set_tag(1);
-    }
-
-    fn unmark(&mut self) {
-        self.0.set_tag(0);
-    }
-
-    fn is_marked(&self) -> bool {
-        self.0.tag() == 1
+impl From<vtable::VTPtr> for VTablePtrUnion {
+    fn from(vt: vtable::VTPtr) -> Self {
+        Self { vt }
     }
 }
 
 /// A GC object header that's exactly 2 pointers wide.
 #[repr(C)]
 struct GCHeader {
-    /// Table to the vtable and mark bit. If the halfspace is being copied, this will be a forward
-    /// pointer.
-    vt: Cell<VTPtr>,
+    /// Table to the vtable and mark bit.
+    ///
+    /// This field will be occupied as a forward pointer during GC. As this is rarely used,
+    /// the usual vtable pointer operations are marked **without** the `unsafe` keyword and assumed
+    /// as the default operation. Take care when using this field during GC.
+    vt: Cell<VTablePtrUnion>,
     /// The total size of the cell, including the header.
     sz: usize,
 }
 
 impl GCHeader {
+    /// Get the vtable pointer from the header.
+    pub fn get_vt(&self) -> vtable::VTPtr {
+        unsafe { self.vt.get().vt }
+    }
+
     /// Mark the object as accessible. Returns true if the object was already marked.
     pub fn mark(&self) -> bool {
-        let mut vt = self.vt.get();
+        let mut vt = unsafe { self.vt.get().vt };
         let was_marked = vt.is_marked();
         if was_marked {
             return true;
         }
         vt.mark();
-        self.vt.set(vt);
+        self.vt.set(vt.into());
         false
     }
 
     pub fn unmark(&self) {
-        let mut vt = self.vt.get();
+        let mut vt = unsafe { self.vt.get().vt };
         vt.unmark();
-        self.vt.set(vt);
+        self.vt.set(vt.into());
     }
 
     /// Write a new forward pointer to the header.
-    pub fn set_fwd_ptr(&self, ptr: *const u8) {
+    ///
+    /// # Safety
+    ///
+    /// Only valid during GC.
+    pub unsafe fn set_fwd_ptr(&self, ptr: *const u8) {
         let mut vt = self.vt.get();
-        vt.0.set_ptr(ptr as *const VTable); // It's actually not a VTable, but we don't care
+        vt.fwd = ptr;
         self.vt.set(vt);
     }
 
     /// Get the forward pointer from the header.
-    pub fn fwd_ptr(&self) -> *const u8 {
-        self.vt.get().0.ptr() as *const u8 // It's actually not a VTable, but we don't care
+    ///
+    /// # Safety
+    ///
+    /// Only valid during GC.
+    pub unsafe fn fwd_ptr(&self) -> *const u8 {
+        unsafe { self.vt.get().fwd }
     }
 }
