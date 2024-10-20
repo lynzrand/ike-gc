@@ -45,7 +45,7 @@ static CONS_VTABLE: VTable = VTable {
 
 #[test]
 fn test_main() {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("debug"));
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("trace"));
 
     let mut gc = GCAlloc::new(65536);
 

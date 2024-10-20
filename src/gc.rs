@@ -1,7 +1,7 @@
 use core::panic;
 use std::{cell::Cell, collections::VecDeque, ptr::NonNull};
 
-use log::{debug, error, warn};
+use log::{debug, error, info, trace, warn};
 use memmap2::MmapMut;
 use slotmap::{new_key_type, SlotMap};
 
@@ -34,7 +34,7 @@ pub struct GCAlloc {
 
     from_half: *mut u8,
     to_half: *mut u8,
-    space_size: usize,
+    chunk_size: usize,
 
     from_cursor: usize,
 
@@ -72,7 +72,7 @@ impl GCAlloc {
             from_half,
             to_half,
             from_cursor: 0,
-            space_size: sz,
+            chunk_size: sz,
             in_gc: false,
             work_list: VecDeque::new(),
             handles: SlotMap::with_key(),
@@ -137,12 +137,12 @@ impl GCAlloc {
         }
 
         let sz = (std::mem::size_of::<GCHeader>() + raw_sz).next_multiple_of(ALIGNMENT);
-        let available = self.space_size - self.from_cursor;
+        let available = self.chunk_size - self.from_cursor;
         if sz > available {
-            debug!("Allocate size {} exceeds available space {}", sz, available);
+            trace!("Allocate size {} exceeds available space {}", sz, available);
             self.collect();
 
-            let available = self.space_size - self.from_cursor;
+            let available = self.chunk_size - self.from_cursor;
             if sz > available {
                 warn!("Out of memory: No space for allocation even after GC");
                 return None;
@@ -154,7 +154,7 @@ impl GCAlloc {
             vt: Cell::new(VTPtr::new(vt).into()),
             sz,
         };
-        debug!("Allocating {} + header bytes at {:?}", sz, start_ptr);
+        trace!("Allocating {} + header bytes at {:?}", sz, start_ptr);
 
         unsafe {
             std::ptr::write(start_ptr as *mut GCHeader, header);
@@ -171,7 +171,7 @@ impl GCAlloc {
             sz: available - sz,
         };
         let free_ptr = unsafe { start_ptr.add(sz) as *mut GCHeader };
-        debug!(
+        trace!(
             "Writing free block of size {} at {:?}",
             available - sz,
             free_ptr
@@ -188,18 +188,40 @@ impl GCAlloc {
             panic!("Recursive GC");
         }
 
-        debug!("Starting GC");
+        trace!("Starting GC");
 
         self.in_gc = true;
         self.gc_count += 1;
 
-        // Mark phase
-        // Gather root set
+        debug!("Mark roots");
+        self.mark_roots();
+
+        debug!("Mark phase");
+        self.mark();
+
+        debug!("Copy phase");
+        let alloc_start_size = self.copy(self.from_half, self.to_half, self.chunk_size);
+
+        debug!("Rewrite pointers");
+        self.rewrite_ptrs(self.to_half, self.chunk_size);
+        self.rewrite_handles();
+
+        // Swap spaces
+        debug!("Swapping spaces");
+        std::mem::swap(&mut self.from_half, &mut self.to_half);
+        self.from_cursor = alloc_start_size;
+        self.in_gc = false;
+        info!("GC done");
+    }
+
+    fn mark_roots(&mut self) {
         for handle in self.handles.values() {
-            debug!("Adding handle {:p} to work list", handle.as_ptr());
+            trace!("Adding handle {:p} to work list", handle.as_ptr());
             self.work_list.push_back(header_from_ptr(handle.as_ptr()));
         }
+    }
 
+    fn mark(&mut self) {
         // Process work list
         while let Some(ptr) = self.work_list.pop_front() {
             let hdr = unsafe { ptr.as_ref().unwrap() };
@@ -207,7 +229,7 @@ impl GCAlloc {
             if hdr.mark() {
                 continue;
             }
-            debug!("Marking {:p}", ptr);
+            trace!("Marking {:p}", ptr);
 
             // Call the mark callback
             let vt = hdr.get_vt();
@@ -219,13 +241,15 @@ impl GCAlloc {
                 ((*vt).mark_cb)(self, ptr_from_header(ptr));
             }
         }
+    }
 
+    fn copy(&mut self, from_space: *mut u8, to_space: *mut u8, space_size: usize) -> usize {
         // Copy phase
         let mut to_cursor = 0;
         let mut from_cursor = 0;
-        debug!("Copying objects");
-        while from_cursor < self.space_size {
-            let from_ptr = unsafe { self.from_half.add(from_cursor) };
+        trace!("Copying objects");
+        while from_cursor < self.chunk_size {
+            let from_ptr = unsafe { from_space.add(from_cursor) };
             let hdr = unsafe { (from_ptr as *const GCHeader).as_ref().unwrap() };
             let sz = hdr.sz;
             assert!(
@@ -236,14 +260,14 @@ impl GCAlloc {
             );
 
             if hdr.get_vt().is_free() {
-                debug!("Skipping free block {:p}, size {}", from_ptr, sz);
+                trace!("Skipping free block {:p}, size {}", from_ptr, sz);
                 from_cursor += sz;
                 continue;
             }
 
             let marked = hdr.get_vt().is_marked();
             if !marked {
-                debug!("Freeing {:p} as it's not marked", from_ptr);
+                trace!("Freeing {:p} as it's not marked", from_ptr);
                 unsafe {
                     ((*hdr.get_vt().ptr()).free_cb)(self, from_ptr);
                 }
@@ -251,8 +275,8 @@ impl GCAlloc {
                 continue;
             }
 
-            let to_ptr = unsafe { self.to_half.add(to_cursor) };
-            debug!("Copying {:p} to {:p}", from_ptr, to_ptr);
+            let to_ptr = unsafe { to_space.add(to_cursor) };
+            trace!("Copying {:p} to {:p}", from_ptr, to_ptr);
             unsafe {
                 std::ptr::copy_nonoverlapping(from_ptr, to_ptr, sz);
             }
@@ -266,29 +290,27 @@ impl GCAlloc {
         // Write free block at the end
         let free_header = GCHeader {
             vt: Cell::new(VTPtr::new_free().into()),
-            sz: self.space_size - to_cursor,
+            sz: space_size - to_cursor,
         };
-        let free_ptr = unsafe { self.to_half.add(to_cursor) as *mut GCHeader };
-        debug!(
+        let free_ptr = unsafe { to_space.add(to_cursor) as *mut GCHeader };
+        trace!(
             "Writing free block of size {} at {:?}",
-            self.space_size - to_cursor,
+            space_size - to_cursor,
             free_ptr
         );
         unsafe {
             std::ptr::write(free_ptr, free_header);
         }
 
-        let new_from_cursor = to_cursor;
+        to_cursor
+    }
 
+    fn rewrite_ptrs(&mut self, space: *mut u8, space_size: usize) {
         // Rewrite pointers
-        debug!("Rewriting pointers");
+        trace!("Rewriting pointers");
         let mut cursor = 0;
-        while cursor < new_from_cursor {
-            let hdr = unsafe {
-                (self.to_half.add(cursor) as *const GCHeader)
-                    .as_ref()
-                    .unwrap()
-            };
+        while cursor < space_size {
+            let hdr = unsafe { (space.add(cursor) as *const GCHeader).as_ref().unwrap() };
             let sz = hdr.sz;
             let total_sz = sz + std::mem::size_of::<GCHeader>();
 
@@ -303,21 +325,17 @@ impl GCAlloc {
 
             cursor += total_sz;
         }
+    }
+
+    fn rewrite_handles(&mut self) {
         // rewrite handles
         for handle in self.handles.values_mut() {
             let ptr = handle.as_ptr();
             let header = header_from_ptr(ptr);
             let fwd_ptr = unsafe { (*header).fwd_ptr() };
-            debug!("Rewriting handle {:p} to {:p}", ptr, fwd_ptr);
+            trace!("Rewriting handle {:p} to {:p}", ptr, fwd_ptr);
             *handle = NonNull::new(fwd_ptr as *mut u8).unwrap();
         }
-
-        // Swap spaces
-        debug!("Swapping spaces");
-        std::mem::swap(&mut self.from_half, &mut self.to_half);
-        self.from_cursor = new_from_cursor;
-        self.in_gc = false;
-        debug!("GC done");
     }
 
     /// Call this to mark a pointer as accessible.
@@ -329,12 +347,12 @@ impl GCAlloc {
     pub fn rewrite_ptr<T>(&mut self, ptr: &Gc<T>) {
         let header = header_from_ptr(ptr);
         let fwd = unsafe { (*header).fwd_ptr() };
-        debug!("Rewriting {:p} to {:p}", ptr.get(), fwd);
+        trace!("Rewriting {:p} to {:p}", ptr.get(), fwd);
         ptr.set(fwd as *const T);
     }
 
     pub fn in_young_gen<T>(&self, ptr: Gc<T>) -> bool {
         (ptr.get() as usize) >= (self.from_half as usize)
-            && (ptr.get() as usize) < (self.from_half as usize + self.space_size)
+            && (ptr.get() as usize) < (self.from_half as usize + self.chunk_size)
     }
 }
